@@ -1,14 +1,21 @@
-import puppeteer from "puppeteer";
+import chromium from "chrome-aws-lambda";
+import puppeteer from "puppeteer-core";
 
 export default async function handler(req, res) {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "No URL provided" });
 
+  let browser = null;
   try {
-    const browser = await puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    // Launch chrome-aws-lambda's bundled Chromium or fallback to local puppeteer-core executable
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath,
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
     });
+
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
@@ -61,10 +68,11 @@ export default async function handler(req, res) {
       };
     });
 
-    await browser.close();
     res.status(200).json(data);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Internal error", details: e.message });
+  } finally {
+    if (browser) await browser.close();
   }
 }
