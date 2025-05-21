@@ -1,4 +1,5 @@
-import puppeteer from "puppeteer";
+import chromium from "chrome-aws-lambda";
+import puppeteer from "puppeteer-core";
 
 export default async function handler(req, res) {
   const { url } = req.query;
@@ -6,11 +7,13 @@ export default async function handler(req, res) {
 
   try {
     const browser = await puppeteer.launch({
-      headless: "new",
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: chromium.args,
+      executablePath: await chromium.executablePath,
+      headless: chromium.headless,
     });
+
     const page = await browser.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
 
     const data = await page.evaluate(() => {
       const elements = Array.from(document.querySelectorAll("*"));
@@ -23,12 +26,8 @@ export default async function handler(req, res) {
         const bg = style.backgroundColor;
         const font = style.fontFamily;
 
-        if (color && !colorMap[color]) colorMap[color] = 0;
-        if (color) colorMap[color]++;
-
-        if (bg && !colorMap[bg]) colorMap[bg] = 0;
-        if (bg) colorMap[bg]++;
-
+        if (color) colorMap[color] = (colorMap[color] || 0) + 1;
+        if (bg) colorMap[bg] = (colorMap[bg] || 0) + 1;
         if (font) fonts.add(font);
       }
 
