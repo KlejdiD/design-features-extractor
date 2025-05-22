@@ -1,18 +1,13 @@
 import puppeteer from "puppeteer-core";
 import chromium from "@sparticuz/chromium";
 
-// Configure the API route
+// Simple configuration
 export const config = {
-  api: {
-    responseLimit: false,
-    bodyParser: {
-      sizeLimit: "1mb",
-    },
-  },
+  maxDuration: 60,
 };
 
-// Helper function to determine if we're in a development environment
-const isDev = process.env.NODE_ENV === "development";
+// Helper function - use local puppeteer unless we're on Vercel
+const useLocal = !process.env.VERCEL;
 
 export default async function handler(req, res) {
   // Only allow GET requests
@@ -33,43 +28,31 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Invalid URL format" });
   }
 
+  let browser = null;
+
   try {
     console.log("Starting browser launch process...");
 
-    let browser;
-
-    // Different browser launch configurations for development vs production
-    if (isDev) {
-      // For local development, try to use puppeteer directly
-      // You'll need to install puppeteer as a dev dependency: npm install -D puppeteer
+    if (useLocal) {
+      console.log("Local environment - using local puppeteer");
       try {
-        console.log(
-          "Development environment detected, trying to use local Chrome..."
-        );
         const puppeteerDev = require("puppeteer");
         browser = await puppeteerDev.launch({
           headless: "new",
           args: ["--no-sandbox", "--disable-setuid-sandbox"],
         });
-      } catch (devError) {
-        console.error("Failed to launch local Chrome:", devError);
-        console.log("Trying fallback method...");
-
-        // Fallback method: Use puppeteer-core with system Chrome
+      } catch (e) {
+        console.log("Fallback to puppeteer-core in dev");
         browser = await puppeteer.launch({
-          headless: true,
           args: ["--no-sandbox", "--disable-setuid-sandbox"],
-          // On Windows, Chrome is usually in one of these locations
           executablePath:
             process.platform === "win32"
-              ? process.env.CHROME_PATH ||
-                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" ||
-                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
-              : process.env.CHROME_PATH || "/usr/bin/google-chrome",
+              ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+              : "/usr/bin/google-chrome",
         });
       }
     } else {
-      // For production, use @sparticuz/chromium
+      // Production environment
       console.log(
         "Production environment detected, using @sparticuz/chromium..."
       );
@@ -84,6 +67,33 @@ export default async function handler(req, res) {
 
     console.log("Browser launched successfully!");
     const page = await browser.newPage();
+
+    // Block unnecessary resources to avoid CORS and loading issues
+    await page.setRequestInterception(true);
+    page.on("request", (request) => {
+      const resourceType = request.resourceType();
+      const requestUrl = request.url();
+
+      // Block resources that commonly cause CORS issues
+      if (
+        resourceType === "image" ||
+        resourceType === "media" ||
+        requestUrl.includes("beacon.min.js") ||
+        requestUrl.includes("cloudflareinsights") ||
+        requestUrl.includes("google-analytics") ||
+        requestUrl.includes("gtag") ||
+        requestUrl.includes("facebook.net") ||
+        requestUrl.includes("doubleclick") ||
+        requestUrl.includes(".woff") ||
+        requestUrl.includes(".woff2") ||
+        requestUrl.includes(".ttf") ||
+        requestUrl.includes(".otf")
+      ) {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    });
 
     // Set a user agent
     await page.setUserAgent(
@@ -113,19 +123,34 @@ export default async function handler(req, res) {
 
       // Process elements for colors and fonts
       for (const el of elements) {
-        const style = getComputedStyle(el);
-        const color = style.color;
-        const bg = style.backgroundColor;
-        const font = style.fontFamily;
+        try {
+          const style = getComputedStyle(el);
+          const color = style.color;
+          const bg = style.backgroundColor;
+          const font = style.fontFamily;
 
-        if (color && !color.includes("rgba(0, 0, 0, 0)")) {
-          colorMap[color] = (colorMap[color] || 0) + 1;
-        }
-        if (bg && !bg.includes("rgba(0, 0, 0, 0)")) {
-          colorMap[bg] = (colorMap[bg] || 0) + 1;
-        }
-        if (font) {
-          fonts.add(font);
+          if (
+            color &&
+            !color.includes("rgba(0, 0, 0, 0)") &&
+            color !== "rgba(0, 0, 0, 0)"
+          ) {
+            colorMap[color] = (colorMap[color] || 0) + 1;
+          }
+          if (
+            bg &&
+            !bg.includes("rgba(0, 0, 0, 0)") &&
+            bg !== "rgba(0, 0, 0, 0)"
+          ) {
+            colorMap[bg] = (colorMap[bg] || 0) + 1;
+          }
+          if (font && font !== "serif" && font !== "sans-serif") {
+            const cleanFont = font.split(",")[0].replace(/['"]/g, "").trim();
+            if (cleanFont.length > 2) {
+              fonts.add(cleanFont);
+            }
+          }
+        } catch (e) {
+          continue;
         }
       }
 
@@ -136,59 +161,70 @@ export default async function handler(req, res) {
         .filter((color) => color.count > 3);
 
       // Detect technologies
-      const resources = Array.from(
-        document.querySelectorAll("script[src], link[rel='stylesheet']")
-      ).map((el) => el.src || el.href);
-
       const technologies = [];
 
+      const scripts = Array.from(document.querySelectorAll("script[src]"));
+      const links = Array.from(document.querySelectorAll("link[href]"));
+
+      const scriptSrcs = scripts.map((s) => s.src.toLowerCase());
+      const linkHrefs = links.map((l) => l.href.toLowerCase());
+      const allResources = [...scriptSrcs, ...linkHrefs];
+
       // Framework detection
-      if (resources.some((r) => r && r.includes("wp-content")))
+      if (
+        allResources.some(
+          (r) => r.includes("wp-content") || r.includes("wp-includes")
+        )
+      ) {
         technologies.push("WordPress");
-      if (resources.some((r) => r && r.includes("shopify")))
+      }
+      if (allResources.some((r) => r.includes("shopify"))) {
         technologies.push("Shopify");
-      if (resources.some((r) => r && r.includes("react")))
+      }
+      if (allResources.some((r) => r.includes("react"))) {
         technologies.push("React");
-      if (resources.some((r) => r && r.includes("vue")))
+      }
+      if (allResources.some((r) => r.includes("vue"))) {
         technologies.push("Vue.js");
-      if (resources.some((r) => r && r.includes("bootstrap")))
+      }
+      if (allResources.some((r) => r.includes("bootstrap"))) {
         technologies.push("Bootstrap");
-      if (resources.some((r) => r && r.includes("tailwind")))
+      }
+      if (allResources.some((r) => r.includes("tailwind"))) {
         technologies.push("Tailwind CSS");
-      if (resources.some((r) => r && r.includes("squarespace")))
-        technologies.push("Squarespace");
-      if (resources.some((r) => r && r.includes("wix")))
-        technologies.push("Wix");
-      if (resources.some((r) => r && r.includes("jquery")))
+      }
+      if (allResources.some((r) => r.includes("jquery"))) {
         technologies.push("jQuery");
+      }
 
       // Check meta tags
-      if (
-        document.querySelector("meta[name='generator'][content*='WordPress']")
-      )
-        technologies.push("WordPress");
-      if (document.querySelector("meta[name='generator'][content*='Wix']"))
-        technologies.push("Wix");
+      const metaTags = Array.from(document.querySelectorAll("meta"));
+      metaTags.forEach((meta) => {
+        const generator = meta.getAttribute("name");
+        const content = meta.getAttribute("content") || "";
 
-      // Check global variables
-      if (window.React) technologies.push("React");
-      if (window.Vue) technologies.push("Vue.js");
-      if (window.angular || window.ng) technologies.push("Angular");
-      if (window.jQuery || window.$) technologies.push("jQuery");
+        if (
+          generator === "generator" &&
+          content.toLowerCase().includes("wordpress")
+        ) {
+          technologies.push("WordPress");
+        }
+      });
 
       // Remove duplicates
       const uniqueTechnologies = [...new Set(technologies)];
 
       return {
-        title: document.title,
-        colors,
-        fonts: Array.from(fonts).slice(0, 10),
+        title: document.title || "Untitled",
+        colors: colors.slice(0, 15),
+        fonts: Array.from(fonts).slice(0, 8),
         technologies: uniqueTechnologies,
       };
     });
 
     console.log("Data extracted, closing browser...");
     await browser.close();
+    browser = null;
 
     console.log("Sending response...");
     return res.status(200).json(data);
@@ -198,7 +234,14 @@ export default async function handler(req, res) {
     return res.status(500).json({
       error: "Failed to analyze website",
       details: error.message,
-      stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
     });
+  } finally {
+    if (browser !== null) {
+      try {
+        await browser.close();
+      } catch (closeError) {
+        console.error("Error closing browser:", closeError);
+      }
+    }
   }
 }
